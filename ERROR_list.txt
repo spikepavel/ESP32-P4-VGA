@@ -1,2 +1,0 @@
-E (3665) async_mcp.gdma: mcp_gdma_memcpy(359): failed to create TX link list
-E (3672) gdma-link: gdma_new_link_list(85): no mem for link list items

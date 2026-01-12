@@ -2,56 +2,14 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_rgb.h>
 #include <esp_async_memcpy.h>
-#include <esp_log.h>
+#include <esp_err.h>
 
-VGA::VGA() {
-    cursorX = cursorY = cursorBaseX = 0;
-    frontColor = backColor = 0;
-    font = nullptr;
-    autoScroll = true;
-    _task_handle = NULL;
-    _panel_handle = NULL;
-    _frBuf[0] = _frBuf[1] = NULL;
-    _sem_vsync_end = _sem_gui_ready = _sem_bounce_notify = NULL;
-    _bounce_q = NULL;
-    _fbIndex = 0;
-}
+#include "esp_cache.h"
 
-VGA::~VGA() {
-    // освободить ресурсы безопасно (если были созданы)
-    if (_task_handle) {
-        vTaskDelete(_task_handle);
-        _task_handle = NULL;
-    }
-    if (_panel_handle) {
-        esp_lcd_panel_del(_panel_handle);
-        _panel_handle = NULL;
-    }
-    if (_frBuf[0]) {
-        heap_caps_free(_frBuf[0]);
-        _frBuf[0] = NULL;
-    }
-    if (_frBuf[1]) {
-        heap_caps_free(_frBuf[1]);
-        _frBuf[1] = NULL;
-    }
-    if (_sem_vsync_end) { vSemaphoreDelete(_sem_vsync_end); _sem_vsync_end = NULL; }
-    if (_sem_gui_ready) { vSemaphoreDelete(_sem_gui_ready); _sem_gui_ready = NULL; }
-    if (_sem_bounce_notify) { vSemaphoreDelete(_sem_bounce_notify); _sem_bounce_notify = NULL; }
-    if (_bounce_q) { vQueueDelete(_bounce_q); _bounce_q = NULL; }
-}
+#include <string.h>
+#include <assert.h>
 
-static const char* TAG = "VGA";
-
-const async_memcpy_config_t async_mem_cfg = {
-.backlog = 1280,
-.sram_trans_align = 64,
-.psram_trans_align = 64,
-.flags = 0
-};
-async_memcpy_t async_mem_handle;
-
-// pin definitions
+// pin definitions (оставлены ваши значения)
 #define VGA_PIN_NUM_HSYNC          33
 #define VGA_PIN_NUM_VSYNC          32
 #define VGA_PIN_NUM_DE             -1
@@ -61,14 +19,14 @@ async_memcpy_t async_mem_handle;
 #define VGA_PIN_NUM_DATA1          -1  //R1
 #define VGA_PIN_NUM_DATA2          -1  //R2
 #define VGA_PIN_NUM_DATA3          -1  //R3
-#define VGA_PIN_NUM_DATA4           4  //R4
+#define VGA_PIN_NUM_DATA4          4  //R4
 
 #define VGA_PIN_NUM_DATA5          -1   //G0
 #define VGA_PIN_NUM_DATA6          -1  //G1
 #define VGA_PIN_NUM_DATA7          -1  //G2
 #define VGA_PIN_NUM_DATA8          -1  //G3
 #define VGA_PIN_NUM_DATA9          -1  //G4
-#define VGA_PIN_NUM_DATA10          5  //G5
+#define VGA_PIN_NUM_DATA10         5  //G5
 
 #define VGA_PIN_NUM_DATA11         -1  //B0
 #define VGA_PIN_NUM_DATA12         -1  //B1
@@ -76,84 +34,49 @@ async_memcpy_t async_mem_handle;
 #define VGA_PIN_NUM_DATA14         -1  //B3
 #define VGA_PIN_NUM_DATA15         20  //B4
 
-#define VGA_PIN_NUM_DISP_EN        -1
+#define VGA_PIN_NUM_DISP_EN        -1 //LCD only
 
-// Task stack/prio for handling bounce copies
-#define VGA_TASK_STACK_SIZE 4096
-#define VGA_TASK_PRIO       5
-
-// --- internal task to handle async copies and buffer swaps ---
-
-void VGA::vga_task(void* arg) {
-VGA* vga = (VGA*)arg;
-for (;;) {
-// wait for bounce event from ISR
-if (xSemaphoreTake(vga->_sem_bounce_notify, portMAX_DELAY) == pdTRUE) {
-// process pending bounce records
-while (true) {
-// pop record
-BaseType_t has = xQueueReceive(vga->_bounce_q, &vga->_bounce_rec, 0);
-if (has != pdTRUE) break;
-
-
-            // prepare pointers
-            int pos_px = vga->_bounce_rec.pos_px;
-            int len_bytes = vga->_bounce_rec.len_bytes;
-            uint16_t* bounce_buf = (uint16_t*)vga->_bounce_rec.bounce_buf;
-
-            int screenLineIndex = pos_px / vga->_Width;
-            uint16_t* pptr = vga->_frBuf[vga->_fbIndex] + (screenLineIndex * vga->_Width);
-            size_t copyBytes = (size_t)len_bytes;
-
-            // perform async memcpy from pptr -> bounce_buf
-            esp_async_memcpy(async_mem_handle, bounce_buf, pptr, copyBytes, NULL, NULL);
-
-            // if this bounce reaches lastBBuf, schedule swap after async memcpy completes
-            if (pos_px >= vga->_lastBBuf) {
-                // give vsync_end semaphore so drawing task continues; swap buffers here (in task context)
-                if (xSemaphoreTake(vga->_sem_gui_ready, 0) == pdTRUE) {
-                    vga->_fbIndex = 1 - vga->_fbIndex;
-                    xSemaphoreGive(vga->_sem_vsync_end);
-                } else {
-                    // no gui ready flag — still swap to keep display progressing
-                    vga->_fbIndex = 1 - vga->_fbIndex;
-                    xSemaphoreGive(vga->_sem_vsync_end);
-                }
-            }
-        }
-    }
+// async memcpy callback used nowhere here, but provided for completeness.
+// It will give semaphore if used to notify completion.
+static bool async_memcpy_done_cb(async_memcpy_handle_t h, async_memcpy_event_t *event, void *cb_args)
+{
+// cb_args expected to be a SemaphoreHandle_t if used
+SemaphoreHandle_t sem = (SemaphoreHandle_t)cb_args;
+BaseType_t high_task_wakeup = pdFALSE;
+if (sem) {
+xSemaphoreGiveFromISR(sem, &high_task_wakeup);
+}
+return (high_task_wakeup == pdTRUE);
 }
 
-}
-
-// --- class implementation ---
 bool VGA::init(){
 return init(800,600);
 }
 
 bool VGA::init(int width, int height) {
-esp_async_memcpy_install(&async_mem_cfg, &async_mem_handle);
+// install async memcpy driver with default config (ESP32-P4)
+async_memcpy_config_t cfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
+// tune backlog to a large value to allow many queued transfers (example)
+cfg.backlog = 1280;
+cfg.dma_burst_size = 64;
+cfg.flags = 0;
+esp_err_t err = esp_async_memcpy_install_gdma_ahb(&cfg, &async_mem_handle);
+if (err != ESP_OK) {
+return false;
+}
 
+// initialize state
 _Width = width;
 _Height = height;
-_bounceLinesBuf = height / 20;
+_bounceLinesBuf = height / 50;
 _pixClock = 32000000;
-
-// semaphores and queue
 _sem_vsync_end = xSemaphoreCreateBinary();
 assert(_sem_vsync_end);
 _sem_gui_ready = xSemaphoreCreateBinary();
 assert(_sem_gui_ready);
 
-// internal bounce notification queue & semaphore
-_bounce_q = xQueueCreate(32, sizeof(BounceRecord));
-assert(_bounce_q);
-_sem_bounce_notify = xSemaphoreCreateBinary();
-assert(_sem_bounce_notify);
-
-// panel config
 esp_lcd_rgb_panel_config_t panel_config;
-memset(&panel_config, 0, sizeof(panel_config));
+memset(&panel_config, 0, sizeof(esp_lcd_rgb_panel_config_t));
 panel_config.data_width = 16;
 panel_config.bits_per_pixel = 16;
 panel_config.psram_trans_align = 64;
@@ -182,113 +105,124 @@ panel_config.data_gpio_nums[12] = VGA_PIN_NUM_DATA12;
 panel_config.data_gpio_nums[13] = VGA_PIN_NUM_DATA13;
 panel_config.data_gpio_nums[14] = VGA_PIN_NUM_DATA14;
 panel_config.data_gpio_nums[15] = VGA_PIN_NUM_DATA15;
-
 panel_config.timings.pclk_hz = _pixClock;
 panel_config.timings.h_res = _Width;
 panel_config.timings.v_res = _Height;
+
+// Standard VGA 800x600 timings (approx) — keep your previous values
 panel_config.timings.hsync_back_porch = 88;
 panel_config.timings.hsync_front_porch = 40;
 panel_config.timings.hsync_pulse_width = 128;
 panel_config.timings.vsync_back_porch = 23;
 panel_config.timings.vsync_front_porch = 1;
 panel_config.timings.vsync_pulse_width = 4;
+
 panel_config.timings.flags.pclk_active_neg = false;
 panel_config.timings.flags.hsync_idle_low = 0;
 panel_config.timings.flags.vsync_idle_low = 0;
-
 panel_config.flags.fb_in_psram = 0;
 panel_config.flags.double_fb = 0;
 panel_config.flags.no_fb = 1;
 
-esp_err_t ret = esp_lcd_new_rgb_panel(&panel_config, &_panel_handle);
-if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "esp_lcd_new_rgb_panel failed: %d", ret);
-    return false;
-}
+esp_lcd_new_rgb_panel(&panel_config, &_panel_handle);
 
-// allocate framebuffers in PSRAM (if available)
-size_t fbSize = (size_t)_Width * (size_t)_Height * 2;
+size_t fbSize = (size_t)_Width * (size_t)_Height * 2; // bytes (2 per pixel)
 for (int i = 0; i < 2; i++) {
-    _frBuf[i] = (uint16_t*)heap_caps_aligned_alloc(64, fbSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!_frBuf[i]) {
-        ESP_LOGE(TAG, "failed alloc fb %d size %u", i, (unsigned)fbSize);
-        return false;
-    }
-    memset(_frBuf[i], 0, fbSize);
+// allocate in SPIRAM with 64-byte alignment
+_frBuf[i] = (uint16_t*)heap_caps_aligned_alloc(64, fbSize, MALLOC_CAP_SPIRAM);
+assert(_frBuf[i]);
+memset(_frBuf[i], 0, fbSize);
 }
 
 _lastBBuf = _Width * (_Height - _bounceLinesBuf);
 
-// register event callbacks (static methods)
 esp_lcd_rgb_panel_event_callbacks_t cbs = {
-    .on_vsync = &VGA::vsyncEvent,
-    .on_bounce_empty = &VGA::bounceEvent,
+.on_vsync = vsyncEvent,
+.on_bounce_empty = bounceEvent,
 };
 esp_lcd_rgb_panel_register_event_callbacks(_panel_handle, &cbs, this);
 
 esp_lcd_panel_reset(_panel_handle);
 esp_lcd_panel_init(_panel_handle);
 
-// create background task to handle bounces/copies
-if (xTaskCreatePinnedToCore(VGA::vga_task, "vga_task", VGA_TASK_STACK_SIZE, this, VGA_TASK_PRIO, &_task_handle, tskNO_AFFINITY) != pdPASS) {
-    ESP_LOGE(TAG, "failed create vga task");
-    return false;
-}
-
-ESP_LOGI(TAG, "VGA init OK");
 return true;
-
 }
 
-// vsync wait from application (blocks until vsync_end given)
+extern int ScreenID; // внешний указатель на выбранный экран
+
 void VGA::vsyncWait() {
+// signal that GUI drawing can start, then wait for vsync end
 xSemaphoreGive(_sem_gui_ready);
+// wait indefinitely for semaphore from ISR swapBuffers (given via xSemaphoreGiveFromISR)
 xSemaphoreTake(_sem_vsync_end, portMAX_DELAY);
 }
 
-uint16_t* VGA::getDrawBuffer() { // ручной ввод буфера экрана
-if(ScreenID == 0)
-    return _frBuf[0];
-
-else if(ScreenID == 1)
-    return _frBuf[1];
-
-else if(ScreenID == 2)
-{
-  if (_fbIndex == 1) {
-    return _frBuf[0];
-  } else {
-    return _frBuf[1];
-  }		
-}	
+uint16_t* VGA::getDrawBuffer() {
+if (ScreenID == 0) {
+return _frBuf[0];
+} else if (ScreenID == 1) {
+return _frBuf[1];
+} else if (ScreenID == 2) {
+if (_fbIndex == 1) {
+return _frBuf[0];
+} else {
+return _frBuf[1];
+}
+}
+// default
+return _frBuf[_fbIndex];
 }
 
 uint16_t* VGA::getBackBuffer() {
-return _frBuf[1];
+// return the non-active buffer
+return _frBuf[1 - _fbIndex];
 }
 
-// static IRAM-safe vsync callback: only give semaphore from ISR
-bool IRAM_ATTR VGA::vsyncEvent(esp_lcd_panel_handle_t, const esp_lcd_rgb_panel_event_data_t*, void *user_ctx) {
-VGA* vga = (VGA*)user_ctx;
-BaseType_t woken = pdFALSE;
-xSemaphoreGiveFromISR(vga->_sem_bounce_notify, &woken); // wake task to process any pending bounce records
-if (woken == pdTRUE) portYIELD_FROM_ISR();
+bool IRAM_ATTR VGA::vsyncEvent(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx) {
+// Nothing required here for now. Returning true.
 return true;
 }
 
-// static IRAM-safe bounce callback: push record to queue and signal task
-bool IRAM_ATTR VGA::bounceEvent(esp_lcd_panel_handle_t, void* bounce_buf, int pos_px, int len_bytes, void *user_ctx) {
+void VGA::swapBuffers() {
+// Called from ISR context (esp callback), so use ISR-safe APIs
+if (xSemaphoreTakeFromISR(_sem_gui_ready, NULL) == pdTRUE) {
+_fbIndex = 1 - _fbIndex;
+// notify vsync end to waiting task
+xSemaphoreGiveFromISR(_sem_vsync_end, NULL);
+}
+}
+
+bool IRAM_ATTR VGA::bounceEvent(esp_lcd_panel_handle_t panel, void *bounce_buf, int pos_px, int len_bytes, void *user_ctx) {
 VGA* vga = (VGA*)user_ctx;
-BounceRecord rec;
-rec.bounce_buf = bounce_buf;
-rec.pos_px = pos_px;
-rec.len_bytes = len_bytes;
-// push to queue (FromISR)
-BaseType_t woken = pdFALSE;
-xQueueSendFromISR(vga->_bounce_q, &rec, &woken);
-xSemaphoreGiveFromISR(vga->_sem_bounce_notify, &woken);
-if (woken == pdTRUE) portYIELD_FROM_ISR();
+uint16_t* bbuf = (uint16_t*)bounce_buf;
+
+int screenLineIndex = pos_px / vga->_Width;
+int bufLineIndex = screenLineIndex;
+uint16_t* pptr = vga->_frBuf[vga->_fbIndex] + (bufLineIndex * vga->_Width);
+
+int screenLines = len_bytes / (vga->_Width * sizeof(uint16_t)); // len_bytes is bytes
+if (screenLines <= 0) return true;
+int lines = screenLines;
+uint16_t* bbptr = (uint16_t*)bbuf;
+size_t copyBytes = (size_t)lines * (size_t)vga->_Width * sizeof(uint16_t);
+
+// Use async memcpy; no completion semaphore is required here since transfer is queued
+// We don't pass a callback here (NULL), because bounce callback itself runs in ISR and must be fast.
+
+//The error is in this line.
+//esp_async_memcpy(vga->async_mem_handle, bbptr, pptr, copyBytes, NULL, NULL); //The error is in this line.
+//(void)err; 
+
+memcpy(bbptr, pptr, copyBytes);
+    //вот эту ошибку править завтра!!!
+
+
+// If this bounce buffer reaches last part of frame, swap buffers
+if (pos_px >= vga->_lastBBuf) {
+    vga->swapBuffers();
+}
 return true;
+
 }
 
 void VGA::dot(int x, int y, uint16_t color)
