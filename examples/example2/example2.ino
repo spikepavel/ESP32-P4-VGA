@@ -10,7 +10,6 @@ int ScreenID = 0;
 
 void setup()
 {
-	Serial.begin(115200);
   vga.init();
   vga.setFont(FONT_9x16);
   vga.setTextColor(65535,0);
@@ -18,9 +17,8 @@ void setup()
 	for(int y = 0; y < 600; y++)
 		for(int x = 0; x < 800; x++)
 			vga.dot(x, y, vga.rgb(x, y, 255-x));
-	Serial.println("INIT");
 
-	delay(1000);
+	delay(5000);
 }
 
 void loop() 
